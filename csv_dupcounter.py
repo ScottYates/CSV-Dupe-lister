@@ -2,12 +2,17 @@
 """CSV Duplicate Counter.
 
 Examines a CSV file, lets you choose columns in the order you want, and writes
-a full CSV with an extra ``Dup_Count`` column holding the number of *extra*
-copies (group size - 1) of that row's key combination.
+a full CSV with an extra ``Dup_Count`` column.
+
+The count starts at 0 for the first row of each key combination and rises for
+every further row that shares it, so the rows worth reviewing are exactly
+those with a count above zero. Columns can also be dropped from the output
+entirely, and an optional ``Dup_Key`` column can join the count and the chosen
+fields into one string.
 
 On a terminal, columns are chosen with an arrow-key picker: up/down to move,
-space to toggle, enter to confirm. When the input is piped instead, you type
-your selection.
+space to group by, delete to drop a column, c to toggle the combined field,
+enter to confirm. When the input is piped instead, you type your selection.
 
 Standard library only. Reads and writes using the Windows ANSI code page
 (e.g. cp1252) unless the file carries a UTF-8 BOM or --encoding is given.
@@ -26,6 +31,8 @@ import sys
 from collections import Counter
 
 COUNT_COLUMN = "Dup_Count"
+COMBINED_COLUMN = "Dup_Key"
+DEFAULT_SEPARATOR = " -:- "
 ENCODING_ERRORS = "replace"
 SAMPLE_CHARS = 64 * 1024
 CANDIDATE_DELIMITERS = (",", ";", "\t", "|")
@@ -353,42 +360,104 @@ def _cell(row, index):
     return row[index] if index < len(row) else ""
 
 
-def count_groups(path, encoding, delimiter, indices):
-    """Pass 1: how many rows share each key combination."""
-    counts = {}
-    for row in iter_data_rows(path, encoding, delimiter):
-        key = tuple(_cell(row, index) for index in indices)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def build_output_order(header, indices):
+def build_output_order(header, indices, deleted=(), combined=False):
     """Return (output header, remaining column indices)."""
+    deleted = set(deleted)
     chosen = set(indices)
-    remaining = [index for index in range(len(header)) if index not in chosen]
+    remaining = [index for index in range(len(header))
+                 if index not in chosen and index not in deleted]
     output_header = [COUNT_COLUMN]
+    if combined:
+        output_header.append(COMBINED_COLUMN)
     output_header += [header[index] for index in indices]
     output_header += [header[index] for index in remaining]
     return output_header, remaining
 
 
-def write_output(input_path, output_path, header, encoding, delimiter, indices, counts):
-    """Pass 2: write the full CSV plus the duplicate count. Returns the row count."""
-    output_header, remaining = build_output_order(header, indices)
-    written = 0
+class ExportStats:
+    """What the export found."""
+
+    def __init__(self):
+        self.rows = 0
+        self.distinct_keys = 0
+        self.duplicate_groups = 0
+        self.duplicate_rows = 0
+
+
+def write_output(input_path, output_path, header, encoding, delimiter, indices,
+                 deleted=(), combined=False, separator=DEFAULT_SEPARATOR):
+    """Write the full CSV plus the duplicate count. Returns an ExportStats.
+
+    The count starts at 0 for the first row of each key combination and
+    rises for each further row that shares it, so the rows worth reviewing
+    are exactly those with a count above zero.
+    """
+    output_header, remaining = build_output_order(header, indices, deleted, combined)
+    occurrences = {}
+    stats = ExportStats()
     with open(output_path, "w", encoding=encoding, errors=ENCODING_ERRORS, newline="") as out:
         writer = csv.writer(out, delimiter=delimiter, lineterminator="\r\n")
         writer.writerow(output_header)
         for row in iter_data_rows(input_path, encoding, delimiter):
             key = tuple(_cell(row, index) for index in indices)
-            extras = counts.get(key, 0) - 1
-            out_row = [str(extras)]
+            seen = occurrences.get(key, 0)
+            occurrences[key] = seen + 1
+            out_row = [str(seen)]
+            if combined:
+                out_row.append(separator.join(
+                    [str(seen)] + [_cell(row, index) for index in indices]))
             out_row += [_cell(row, index) for index in indices]
             out_row += [_cell(row, index) for index in remaining]
             out_row += list(row[len(header):])
             writer.writerow(out_row)
-            written += 1
-    return written
+            stats.rows += 1
+    stats.distinct_keys = len(occurrences)
+    stats.duplicate_groups = sum(1 for size in occurrences.values() if size > 1)
+    stats.duplicate_rows = stats.rows - stats.distinct_keys
+    return stats
+
+
+class Selection:
+    """What the user picked: grouping columns, removed columns, combined flag."""
+
+    def __init__(self, columns=None, deleted=None, combined=False):
+        self.columns = list(columns or [])
+        self.deleted = set(deleted or ())
+        self.combined = bool(combined)
+
+    def __repr__(self):
+        return "Selection(columns=%r, deleted=%r, combined=%r)" % (
+            self.columns, sorted(self.deleted), self.combined)
+
+
+def parse_column_list(text, columns):
+    """Resolve a separated list of column names or indices to indices.
+
+    Used for --exclude, where order does not matter and a name containing a
+    space must survive.
+    """
+    result = []
+    for token in [part.strip() for part in re.split(r"[,;]", text or "")]:
+        if not token:
+            continue
+        if token.isdigit():
+            number = int(token)
+            if number < 1 or number > len(columns):
+                raise AppError(
+                    "column %d does not exist (file has %d columns)"
+                    % (number, len(columns)))
+            result.append(number - 1)
+            continue
+        matches = [index for index, name in enumerate(columns)
+                   if name.strip().lower() == token.lower()]
+        if not matches:
+            raise AppError("unknown column '%s'" % token)
+        if len(matches) > 1:
+            raise AppError(
+                "column '%s' is ambiguous (%d matches) - use its number instead"
+                % (token, len(matches)))
+        result.append(matches[0])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -564,15 +633,20 @@ class ColumnPicker:
     columns were picked, escape cancels.
     """
 
-    def __init__(self, columns, context=None):
+    def __init__(self, columns, context=None, deleted=None, combined=False,
+                 separator=DEFAULT_SEPARATOR):
         self.columns = columns
         self.context = list(context or [])
         self.cursor = 0
         self.chosen = []
+        self.deleted = set(deleted or ())
+        self.combined = bool(combined)
+        self.separator = separator
         self.offset = 0
+        self.message = ""
 
     def run(self, reader=None):
-        """Return the ordered column indices, or None if the user cancelled."""
+        """Return a Selection, or None if the user cancelled."""
         stdout = sys.stdout
         try:
             stdout.write(_ANSI_HIDE_CURSOR)
@@ -597,6 +671,7 @@ class ColumnPicker:
             key = reader.read_key()
             if key is None or key in ("esc", "ctrl-c", "ctrl-d"):
                 return None
+            self.message = ""
             if key == "up":
                 self.cursor = max(0, self.cursor - 1)
             elif key == "down":
@@ -614,14 +689,35 @@ class ColumnPicker:
             elif key == "k":
                 self.cursor = max(0, self.cursor - 1)
             elif key == "space":
-                if self.cursor in self.chosen:
-                    self.chosen.remove(self.cursor)
-                else:
-                    self.chosen.append(self.cursor)
+                self._toggle_group()
+            elif key in ("delete", "x"):
+                self._toggle_deleted()
+            elif key == "c":
+                self.combined = not self.combined
             elif key == "enter":
                 if not self.chosen:
+                    self.message = "Pick at least one column to group by."
                     continue
-                return list(self.chosen)
+                return Selection(self.chosen, self.deleted, self.combined)
+
+    def _toggle_group(self):
+        """Add or remove the current column from the grouping keys."""
+        if self.cursor in self.deleted:
+            # A removed column cannot also be a grouping key.
+            self.deleted.discard(self.cursor)
+        if self.cursor in self.chosen:
+            self.chosen.remove(self.cursor)
+        else:
+            self.chosen.append(self.cursor)
+
+    def _toggle_deleted(self):
+        """Remove the current column from the output entirely, or bring it back."""
+        if self.cursor in self.deleted:
+            self.deleted.discard(self.cursor)
+            return
+        self.deleted.add(self.cursor)
+        if self.cursor in self.chosen:
+            self.chosen.remove(self.cursor)
 
     def _render(self):
         import shutil
@@ -639,12 +735,18 @@ class ColumnPicker:
         for line in self.context:
             out.append(line + "\n")
         out.append("Select columns to group by, in order.\n")
-        out.append("  up/down move   space toggle   enter confirm   esc cancel\n")
+        out.append("  up/down move   space group   del remove   c combined   "
+                   "enter confirm   esc cancel\n")
         out.append("\n")
         for index in range(self.offset, min(self.offset + limit, len(self.columns))):
             marker = ">" if index == self.cursor else " "
             name = display_name(self.columns, index)
-            tag = "   [%d]" % (self.chosen.index(index) + 1) if index in self.chosen else ""
+            if index in self.chosen:
+                tag = "   [%d]" % (self.chosen.index(index) + 1)
+            elif index in self.deleted:
+                tag = "   [-]"
+            else:
+                tag = ""
             if len(name) + len(tag) > width - 6:
                 name = name[:max(1, width - 9 - len(tag))] + "..."
             out.append(" %s %3d. %s%s\n" % (marker, index + 1, name, tag))
@@ -656,8 +758,19 @@ class ColumnPicker:
             out.append("Order: %s\n" % order)
         else:
             out.append("Order: (nothing selected yet)\n")
-        out.append("Space toggles a column in or out; the number in brackets is its "
-                   "place in the order.\n")
+        if self.deleted:
+            removed = ", ".join(display_name(self.columns, index)
+                                for index in sorted(self.deleted))
+            out.append("Removed from the output: %s\n" % removed)
+        if self.combined:
+            out.append("Combined field: on  (%s, joined by %r)\n"
+                       % (COMBINED_COLUMN, self.separator))
+        else:
+            out.append("Combined field: off\n")
+        out.append("[n] is the column's place in the grouping order, [-] means it is "
+                   "left out of the output.\n")
+        if self.message:
+            out.append(self.message + "\n")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -674,18 +787,23 @@ def _interactive_terminal_available():
     return True
 
 
-def pick_columns(columns, use_arrow_keys=None, context=None):
-    """Choose columns to group by. Returns ordered indices, or None to cancel."""
+def pick_columns(columns, use_arrow_keys=None, context=None, deleted=None,
+                 combined=False, separator=DEFAULT_SEPARATOR):
+    """Choose columns to group by. Returns a Selection, or None to cancel."""
     if use_arrow_keys is None:
         use_arrow_keys = _interactive_terminal_available()
     if use_arrow_keys:
         try:
-            return ColumnPicker(columns, context=context).run()
+            picker = ColumnPicker(columns, context=context, deleted=deleted,
+                                  combined=combined, separator=separator)
+            return picker.run()
         except Exception:
             # A terminal that will not cooperate falls back to typing.
-            return prompt_for_selection(columns, input_func=input, out=print)
+            return Selection(prompt_for_selection(columns, input_func=input, out=print),
+                             deleted, combined)
     # `input` is resolved here, at call time, so tests can patch builtins.input.
-    return prompt_for_selection(columns, input_func=input, out=print)
+    return Selection(prompt_for_selection(columns, input_func=input, out=print),
+                     deleted, combined)
 
 
 # ---------------------------------------------------------------------------
@@ -693,12 +811,12 @@ def pick_columns(columns, use_arrow_keys=None, context=None):
 # ---------------------------------------------------------------------------
 
 def default_output_path(input_path):
-    """dupes-<input file name> next to the input file."""
+    """<input name>-dupes.<ext> next to the input file."""
     directory = os.path.dirname(os.path.abspath(input_path))
     stem, extension = os.path.splitext(os.path.basename(input_path))
     if not extension:
         extension = ".csv"
-    return os.path.join(directory, "dupes-" + stem + extension)
+    return os.path.join(directory, stem + "-dupes" + extension)
 
 
 def _same_file(first, second):
@@ -728,13 +846,22 @@ def build_parser():
                     "ANSI code page.")
     parser.add_argument("input", help="path to the input CSV file")
     parser.add_argument("output", nargs="?",
-                        help="path for the output CSV "
-                             "(default: <input>_dupcount.csv next to the input)")
+                        help="path for the output CSV (default: <input>-dupes.csv "
+                             "next to the input)")
     parser.add_argument("--encoding", metavar="CODEPAGE",
                         help="override the encoding used for reading and writing, "
                              "e.g. cp1252 or utf-8")
     parser.add_argument("--delimiter", metavar="CHAR",
                         help="override the detected delimiter, e.g. ';' or '\\t'")
+    parser.add_argument("--exclude", metavar="COLUMNS",
+                        help="columns to leave out of the output entirely, by name "
+                             "or number, e.g. \"Notes,4\"")
+    parser.add_argument("--combined", action="store_true",
+                        help="add a %s column joining the count and the chosen "
+                             "fields" % COMBINED_COLUMN)
+    parser.add_argument("--separator", metavar="TEXT", default=DEFAULT_SEPARATOR,
+                        help="separator used by the combined field "
+                             "(default: %r)" % DEFAULT_SEPARATOR)
     return parser
 
 
@@ -764,7 +891,7 @@ def main(argv=None):
         print("Error: %s" % exc)
         return 1
 
-    # Writing over the input would truncate it before the second pass reads
+    # Writing over the input would truncate the file before the export reads
     # it, so refuse that outright rather than destroy the user's data.
     if _same_file(input_path, output_path):
         print("Error: the output file must be different from the input file")
@@ -784,6 +911,12 @@ def main(argv=None):
                 "wrong, re-run with --delimiter"
                 % ", ".join(repr(c) for c in candidates))
 
+    try:
+        excluded = parse_column_list(args.exclude, header) if args.exclude else []
+    except AppError as exc:
+        print("Error: %s" % exc)
+        return 1
+
     arrow_mode = _interactive_terminal_available()
     if arrow_mode:
         print()
@@ -800,21 +933,31 @@ def main(argv=None):
         print()
 
     try:
-        indices = pick_columns(header, use_arrow_keys=arrow_mode, context=info_lines)
+        selection = pick_columns(header, use_arrow_keys=arrow_mode, context=info_lines,
+                                 deleted=excluded, combined=args.combined,
+                                 separator=args.separator)
     except (EOFError, KeyboardInterrupt):
         print()
         print("Cancelled.")
         return 0
 
-    if not indices:
+    if selection is None or not selection.columns:
         print("Cancelled.")
         return 0
 
-    output_header, _ = build_output_order(header, indices)
+    indices = selection.columns
+    deleted = selection.deleted
+    combined = selection.combined
+
+    output_header, _ = build_output_order(header, indices, deleted, combined)
     print()
     print("Grouping by %s, in this order: %s"
           % (_plural(len(indices), "column", "columns"),
              ", ".join(display_name(header, index) for index in indices)))
+    if deleted:
+        print("Leaving %s out of the output: %s"
+              % (_plural(len(deleted), "column", "columns"),
+                 ", ".join(display_name(header, index) for index in sorted(deleted))))
     print("Output layout: %s"
           % ", ".join(name if name.strip() else "(blank)" for name in output_header))
     if COUNT_COLUMN in header:
@@ -836,23 +979,21 @@ def main(argv=None):
     if os.path.exists(output_path):
         print("Overwriting existing file: %s" % output_path)
     try:
-        counts = count_groups(input_path, encoding, delimiter, indices)
-    except OSError as exc:
-        print("Error: cannot read input: %s" % exc)
-        return 1
-    try:
-        written = write_output(input_path, output_path, header, encoding,
-                               delimiter, indices, counts)
+        stats = write_output(input_path, output_path, header, encoding, delimiter,
+                             indices, deleted=deleted, combined=combined,
+                             separator=args.separator)
     except OSError as exc:
         print("Error: cannot write output: %s" % exc)
         return 1
 
-    groups = sum(1 for size in counts.values() if size > 1)
-    print("Read %s from %s" % (_plural(written, "data row", "data rows"), input_path))
+    print("Read %s from %s"
+          % (_plural(stats.rows, "data row", "data rows"), input_path))
     print("%s; %s duplicates"
-          % (_plural(len(counts), "distinct key combination", "distinct key combinations"),
-             _plural(groups, "group contains", "groups contain")))
-    print("Wrote %s to %s" % (_plural(written, "row", "rows"), output_path))
+          % (_plural(stats.distinct_keys, "distinct key combination",
+                     "distinct key combinations"),
+             _plural(stats.duplicate_groups, "group contains", "groups contain")))
+    print("%s have a count above 0" % _plural(stats.duplicate_rows, "row", "rows"))
+    print("Wrote %s to %s" % (_plural(stats.rows, "row", "rows"), output_path))
     print("Done.")
     return 0
 

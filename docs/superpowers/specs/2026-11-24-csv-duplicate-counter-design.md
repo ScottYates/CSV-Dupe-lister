@@ -42,18 +42,24 @@ Two constraints shape the solution:
 ### 4.1 Invocation
 
 ```
-python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE] [--delimiter CHAR]
+python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE]
+                          [--delimiter CHAR] [--exclude COLUMNS] [--combined]
+                          [--separator TEXT]
 ```
 
 - `input.csv` — required.
-- `output.csv` — optional. Default: `dupes-<input file name>` in the input's directory — the
-  original name with `dupes-` in front (`orders.csv` → `dupes-orders.csv`). The original extension is
-  kept; a file with no extension gets `.csv`. **An existing output file is overwritten**, and the app
-  says so when it happens. The output path must never be the input path.
+- `output.csv` — optional. Default: `<input name>-dupes.<ext>` in the input's directory — the
+  original name with `-dupes` in front of the extension (`orders.csv` → `orders-dupes.csv`). The
+  original extension is kept; a file with no extension gets `.csv`. **An existing output file is
+  overwritten**, and the app says so when it happens. The output path must never be the input path.
 - `--encoding` — optional override, e.g. `--encoding cp1252`, `--encoding utf-8`. Overrides all
   automatic detection.
 - `--delimiter` — optional override for the detected delimiter, e.g. `--delimiter ";"`. Use it when
   the file's own values contain the delimiter often enough that detection is ambiguous.
+- `--exclude COLUMNS` — columns to leave out of the output entirely, by name or number, e.g.
+  `--exclude "Notes,4"`. This is the script equivalent of the picker's delete key.
+- `--combined` — add the `Dup_Key` column. This is the script equivalent of the picker's `c` key.
+- `--separator TEXT` — the separator used inside `Dup_Key`. Defaults to `" -:- "`.
 
 ### 4.2 Interaction sequence
 
@@ -68,16 +74,18 @@ Opened orders.csv
   columns  : 5
 
 Select columns to group by, in order.
-  up/down move   space toggle   enter confirm   esc cancel
+  up/down move   space group   del remove   c combined   enter confirm   esc cancel
 
      1. OrderID
      2. Customer
  >   3. City        [1]
      4. Item        [2]
-     5. Qty
+     5. Qty         [-]
 
 Order: City, Item
-Space toggles a column in or out; the number in brackets is its place in the order.
+Removed from the output: Qty
+Combined field: on  (Dup_Key, joined by ' -:- ')
+[n] is the column's place in the grouping order, [-] means it is left out of the output.
 ```
 
 | Key | Action |
@@ -85,13 +93,16 @@ Space toggles a column in or out; the number in brackets is its place in the ord
 | Up / Down (or `k` / `j`) | Move the cursor one row |
 | Home / End | Jump to the first / last column |
 | Page Up / Page Down | Move ten rows |
-| Space | Toggle the current column in or out of the selection |
+| Space | Add or remove the current column from the grouping keys |
+| Delete (or `x`) | Remove the current column from the output entirely, or bring it back |
+| `c` | Switch the combined `Dup_Key` field on or off |
 | Enter | Confirm and proceed to the export |
 | Escape (or Ctrl+C / Ctrl+D) | Cancel; nothing is written |
 
-The number in brackets is the column's **position in the selection order**, so the picker shows the
-ordering the user is building, not just which columns are on. Toggling a selected column again
-removes it and closes the gap in the order.
+The number in brackets is the column's **position in the grouping order**, so the picker shows the
+ordering the user is building, not just which columns are on. `[-]` marks a column that will be left
+out of the output. Pressing Enter with nothing selected shows "Pick at least one column to group
+by." rather than doing nothing.
 
 Enter confirms the selection *and* proceeds — the arrow-key picker needs no second confirmation
 prompt, because the selection is already visible on screen as it is being built.
@@ -152,8 +163,20 @@ Selection input rules (typed fallback):
 Output column order is:
 
 1. `Dup_Count` — the count column.
-2. The selected columns, **in the order the user selected them**.
-3. All remaining original columns, in the original file's column order.
+2. `Dup_Key` — the combined field, only when it is switched on.
+3. The selected columns, **in the order the user selected them**.
+4. All remaining original columns, in the original file's column order, minus any column the user
+   removed with the delete key.
+
+**Removing a column.** The delete key drops a column from the output entirely — its values are not
+written at all. A column cannot be both a grouping key and removed: deleting one that was selected
+also unselects it, and selecting one that was deleted brings it back. Deleted columns keep their
+original place in the file, so the remaining columns stay in their original order around the gap.
+
+**The combined field.** When switched on, `Dup_Key` holds the count and the selected field values
+joined by the separator: with `City` and `Item` chosen and a count of 2, it reads
+`2 -:- Lisbon -:- Widget`. The count comes first, then each selected field in the order the user
+picked them. The separator defaults to `" -:- "` and is configurable with `--separator`.
 
 Edge cases fixed here:
 
@@ -167,14 +190,20 @@ Edge cases fixed here:
 
 ### 4.4 Duplicate-count semantics
 
-The count column shows **extra copies beyond the first** — i.e. `group_size - 1`.
+The count starts at **0** for the first row of each key combination and rises for every further row
+that shares it. A group is the set of rows whose selected column values are exactly equal.
 
-A group is the set of rows whose selected column values are exactly equal.
+- The first row of a group gets `Dup_Count = 0` — it is the original.
+- The second row of that group gets `Dup_Count = 1` — one record after the first.
+- The third gets `2`, the fourth `3`, and so on.
 
-- A row that is the only one in its group gets `Dup_Count = 0` — it is unique, nothing to delete.
-- A row in a group of 3 gets `Dup_Count = 2` — two *other* rows share its key.
-- Every row in the same group carries the same count, so sorting by `Dup_Count` descending surfaces
-  the duplicates first.
+So the count says *how many records after the first this row is*, and it increases as more
+duplicates are found. The rows worth reviewing are exactly those with a count above zero: filtering
+`Dup_Count > 0` in Excel selects the duplicate rows and leaves the original in place, whereas a
+group-size count would mark every row in the group, including the one you want to keep.
+
+Because the count depends on the order of the rows within a group, the input order is preserved in
+the output.
 
 ### 4.5 Worked example
 
@@ -265,26 +294,30 @@ each, so each can be tested in isolation.
 | `consistent_delimiters(path, encoding)` | Every candidate that splits the file consistently — more than one means the file is ambiguous. |
 | `read_header(path, encoding, delimiter)` | Return the list of column names exactly as stored, minus a leading BOM character. Names are never stripped or renamed. |
 | `parse_selection(text, columns)` | Turn user input into an ordered list of 0-based indices. Raise `SelectionError` with a readable message on bad input. |
+| `parse_column_list(text, columns)` | Resolve a separated list of names or indices to indices — used by `--exclude`. |
+| `Selection` | What the user picked: the grouping columns, the removed columns, and the combined flag. |
 | `pick_columns(columns, use_arrow_keys, context)` | Interactive chooser. Uses the arrow-key picker on a terminal, the typed prompt otherwise. |
 | `ColumnPicker` | Draws the column list and handles up/down/space/enter/escape. |
 | `KeyReader` | Reads single keypresses including the arrow keys, on Windows (`msvcrt`) and POSIX (`termios`/`select`). |
-| `count_groups(path, encoding, delimiter, indices)` | Pass 1: build `{key_tuple: group_size}`. |
-| `write_output(...)` | Pass 2: re-read the source, write `Dup_Count` + selected + remaining. |
+| `write_output(...)` | One pass over the source: write `Dup_Count`, the optional `Dup_Key`, the selected columns and the remaining ones. Returns an `ExportStats`. |
+| `ExportStats` | Rows written, distinct key combinations, groups with duplicates, rows with a count above 0. |
 | `build_output_order(header, indices)` | Compute the final column order. |
 | `_same_file(first, second)` | True when two paths point at the same file — used to refuse writing over the input. |
 | `main(argv)` | Parse args, orchestrate, print the summary. |
 
 ### 7.1 Memory strategy
 
-Two passes over the input file rather than loading it into memory:
-
-- Pass 1 (`count_groups`) reads rows one at a time and stores only
-  `{tuple_of_selected_values: int}`. Memory is proportional to the number of *distinct key
-  combinations*, not the number of rows.
-- Pass 2 (`write_output`) re-opens the file and streams rows straight to the output file, writing each
-  row as it is read.
+`write_output` makes a single pass over the input file rather than loading it into memory. Rows are
+read one at a time and written straight out; the only thing kept is
+`{tuple_of_selected_values: how_many_times_seen}`, which tracks both the count written to each row
+and the group statistics for the summary. Memory is proportional to the number of *distinct key
+combinations*, not the number of rows.
 
 A 500 MB CSV therefore never has to fit in RAM.
+
+A single pass is also what makes the count semantics natural: the count of a row is simply how many
+rows with that key have already been written, so the first row of a group is 0, the second 1, and so
+on, in input order.
 
 ### 7.2 Row handling
 
@@ -340,6 +373,8 @@ typed fallback — and therefore scripted use — possible.
 | File has no header row | `Error: no header row found in <path>` and exit 1 |
 | Output path is the input path | `Error: the output file must be different from the input file` and exit 1, before any prompt |
 | Selected column name not found | `Error: unknown column 'xyz'` and re-prompt |
+| `--exclude` names a column that does not exist | `Error: unknown column 'xyz'` and exit 1 |
+| `--exclude` names two columns with the same name | `Error: column 'K' is ambiguous (2 matches) - use its number instead` and exit 1 |
 | Out-of-range index | `Error: column 99 does not exist (file has 5 columns)` and re-prompt |
 | Duplicate token in selection | `Error: 'City' selected more than once` and re-prompt |
 | Two columns share the typed name | `Error: column 'K' is ambiguous (2 matches) - use its number instead` and re-prompt |
@@ -404,8 +439,15 @@ Coverage:
 27. **Output naming** — the default output path is `dupes-<input name>`; an existing output file is
     overwritten and the app says so.
 28. **End to end through a pseudo-terminal** — the real picker is driven with real arrow-key escape
-    sequences over a pty, and the exported file is checked for correctness. The arrow-key, space and
-    enter paths, and the escape-cancels path, are all exercised this way.
+    sequences over a pty, and the exported file is checked for correctness. The arrow-key, space,
+    delete, `c` and enter paths, and the escape-cancels path, are all exercised this way.
+29. **Count starts at zero** — the first row of a group is 0 and each further row rises by one.
+30. **Deleted columns** — a column marked deleted is absent from the output header and from every
+    row; deleting a grouping column also unselects it, and selecting a deleted column brings it back.
+31. **Combined field** — `Dup_Key` holds the count and the chosen fields joined by the separator,
+    with the count first and the fields in the order they were picked; the separator is configurable.
+32. **Script equivalents** — `--exclude`, `--combined` and `--separator` produce the same result as
+    the corresponding picker keys.
 
 **Verification environment note:** the test suite runs on Linux in the development sandbox. The
 `GetACP()` branch of `resolve_encoding` cannot execute there directly, so it is covered by injecting

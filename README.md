@@ -11,15 +11,20 @@ Python 3.8 or newer. Nothing to install — standard library only.
 ## Running it
 
 ```
-python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE] [--delimiter CHAR]
+python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE]
+                          [--delimiter CHAR] [--exclude COLUMNS] [--combined]
+                          [--separator TEXT]
 ```
 
 | Argument | Meaning |
 |---|---|
 | `<input.csv>` | The file to examine. Required. |
-| `[output.csv]` | Where to write the result. Defaults to `dupes-<input name>` beside the input — `orders.csv` → `dupes-orders.csv`. Must not be the input file. An existing output file is overwritten. |
+| `[output.csv]` | Where to write the result. Defaults to `<input name>-dupes.<ext>` beside the input — `orders.csv` → `orders-dupes.csv`. Must not be the input file. An existing output file is overwritten. |
 | `--encoding` | Override the encoding, e.g. `cp1252` or `utf-8`. Usually unnecessary. |
 | `--delimiter` | Override the detected delimiter, e.g. `--delimiter ";"`. Use when the note below appears. |
+| `--exclude` | Columns to leave out of the output entirely, by name or number: `--exclude "Notes,4"`. |
+| `--combined` | Add the `Dup_Key` column (same as pressing `c` in the picker). |
+| `--separator` | The separator used inside `Dup_Key`. Defaults to `" -:- "`. |
 
 Example:
 
@@ -38,16 +43,18 @@ Opened orders.csv
   columns  : 5
 
 Select columns to group by, in order.
-  up/down move   space toggle   enter confirm   esc cancel
+  up/down move   space group   del remove   c combined   enter confirm   esc cancel
 
      1. OrderID
      2. Customer
  >   3. City        [1]
      4. Item        [2]
-     5. Qty
+     5. Qty         [-]
 
 Order: City, Item
-Space toggles a column in or out; the number in brackets is its place in the order.
+Removed from the output: Qty
+Combined field: on  (Dup_Key, joined by ' -:- ')
+[n] is the column's place in the grouping order, [-] means it is left out of the output.
 ```
 
 | Key | Action |
@@ -55,12 +62,15 @@ Space toggles a column in or out; the number in brackets is its place in the ord
 | Up / Down (or `k` / `j`) | Move the cursor |
 | Home / End | Jump to the first / last column |
 | Page Up / Page Down | Move ten rows |
-| Space | Toggle the current column in or out |
+| Space | Add or remove the current column from the grouping keys |
+| Delete (or `x`) | Drop the current column from the output entirely, or bring it back |
+| `c` | Switch the combined `Dup_Key` field on or off |
 | Enter | Confirm and write the file |
 | Escape (or Ctrl+C) | Cancel, nothing is written |
 
-The number in brackets is where that column sits in your selection, so you can see the order you
-are building. Toggling a column again removes it.
+The number in brackets is where that column sits in your grouping order, so you can see the order
+you are building. `[-]` marks a column that will be left out of the output. A column cannot be both
+a grouping key and removed — deleting one unselects it, selecting one brings it back.
 
 If the input is piped rather than typed at a terminal, you get the numbered list and can type your
 selection instead:
@@ -83,16 +93,21 @@ The order you give is the order the columns appear in the output.
 
 ## What the output looks like
 
-The output is written next to the input as `dupes-<input name>`. If a file with
-that name already exists it is overwritten, and the app tells you when it does
-that. It contains every original column plus one new column, `Dup_Count`:
+The output is written next to the input as `<input name>-dupes.<ext>`. If a
+file with that name already exists it is overwritten, and the app tells you when
+it does that. It contains every original column except any you removed, plus
+the new columns:
 
-- `Dup_Count` is the number of **extra copies** of that row — the group size
-  minus one. A row with `Dup_Count = 0` is unique. A row with `Dup_Count = 3`
-  has three other rows sharing its key combination.
-- Every row in the same group carries the same count.
-- Column order: `Dup_Count`, then the columns you chose in your order, then
-  all remaining columns in the order they appeared in the original file.
+- `Dup_Count` starts at **0** for the first row of each key combination and
+  rises for every further row that shares it. The first row is the original
+  (`0`), the next is `1`, then `2`, and so on — so filtering `Dup_Count > 0`
+  selects exactly the duplicate rows and leaves the original in place.
+- `Dup_Key` (only when switched on with `c`) holds the count and your chosen
+  field values joined by the separator: `2 -:- Lisbon -:- Widget`. The
+  separator is configurable with `--separator`.
+- Column order: `Dup_Count`, `Dup_Key`, then the columns you chose in your
+  order, then all remaining columns in the order they appeared in the original
+  file.
 - Rows stay in their original order.
 
 Example — source:
@@ -108,13 +123,18 @@ Choosing `City` and `Item` gives:
 
 ```
 Dup_Count,City,Item,OrderID,Customer,Qty
-1,Lisbon,Widget,1001,Acme,2
+0,Lisbon,Widget,1001,Acme,2
 1,Lisbon,Widget,1002,Globex,5
 0,Lisbon,Gadget,1003,Acme,1
+2,Lisbon,Widget,1004,Initech,3
+3,Lisbon,Widget,1005,Acme,7
 ```
 
-In Excel: sort by `Dup_Count` descending to bring the duplicates to the top,
-then filter on `Dup_Count > 0` to see only the rows you might want to review.
+`Lisbon`/`Widget` appears four times, so those rows are numbered 0, 1, 2, 3 —
+the 0 is the original, the other three are duplicates.
+
+In Excel: filter on `Dup_Count > 0` to see only the rows you might want to
+review.
 
 ## Encoding
 
