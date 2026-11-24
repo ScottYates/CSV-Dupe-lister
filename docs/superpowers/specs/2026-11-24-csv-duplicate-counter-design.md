@@ -46,8 +46,10 @@ python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE] [--delim
 ```
 
 - `input.csv` — required.
-- `output.csv` — optional. Default: `<input-stem>_dupcount.csv` in the input's directory. The
-  extension is always `.csv`; the output path must differ from the input path.
+- `output.csv` — optional. Default: `dupes-<input file name>` in the input's directory — the
+  original name with `dupes-` in front (`orders.csv` → `dupes-orders.csv`). The original extension is
+  kept; a file with no extension gets `.csv`. **An existing output file is overwritten**, and the app
+  says so when it happens. The output path must never be the input path.
 - `--encoding` — optional override, e.g. `--encoding cp1252`, `--encoding utf-8`. Overrides all
   automatic detection.
 - `--delimiter` — optional override for the detected delimiter, e.g. `--delimiter ";"`. Use it when
@@ -55,11 +57,51 @@ python csv_dupcounter.py <input.csv> [output.csv] [--encoding CODEPAGE] [--delim
 
 ### 4.2 Interaction sequence
 
-```
-$ python csv_dupcounter.py orders.csv
+The primary interface is an **arrow-key column picker**. When the input and output are both real
+terminals, the app switches the terminal into a mode where each key arrives immediately, draws the
+column list itself, and reacts to the keys directly:
 
+```
 Opened orders.csv
-  encoding : cp1252 (Windows ANSI code page)
+  encoding : cp1252
+  delimiter: ,
+  columns  : 5
+
+Select columns to group by, in order.
+  up/down move   space toggle   enter confirm   esc cancel
+
+     1. OrderID
+     2. Customer
+ >   3. City        [1]
+     4. Item        [2]
+     5. Qty
+
+Order: City, Item
+Space toggles a column in or out; the number in brackets is its place in the order.
+```
+
+| Key | Action |
+|---|---|
+| Up / Down (or `k` / `j`) | Move the cursor one row |
+| Home / End | Jump to the first / last column |
+| Page Up / Page Down | Move ten rows |
+| Space | Toggle the current column in or out of the selection |
+| Enter | Confirm and proceed to the export |
+| Escape (or Ctrl+C / Ctrl+D) | Cancel; nothing is written |
+
+The number in brackets is the column's **position in the selection order**, so the picker shows the
+ordering the user is building, not just which columns are on. Toggling a selected column again
+removes it and closes the gap in the order.
+
+Enter confirms the selection *and* proceeds — the arrow-key picker needs no second confirmation
+prompt, because the selection is already visible on screen as it is being built.
+
+**Fallback.** When stdin is not a terminal (piped input, a script, a scheduled job), the app prints
+the numbered column list and accepts a typed selection instead:
+
+```
+Opened orders.csv
+  encoding : cp1252
   delimiter: ,
   columns  : 5
 
@@ -83,11 +125,11 @@ Proceed? [Y/n] y
 
 Read 5 data rows from orders.csv
 2 distinct key combinations; 1 group contains duplicates
-Wrote 5 rows to /path/to/orders_dupcount.csv
+Wrote 5 rows to orders_dupcount.csv
 Done.
 ```
 
-Selection input rules:
+Selection input rules (typed fallback):
 
 - Commas and semicolons separate the columns. `3,1,5` and `3;1;5` are equivalent.
 - Within a segment, a name matching a column exactly wins. This is what lets a column whose name
@@ -223,6 +265,9 @@ each, so each can be tested in isolation.
 | `consistent_delimiters(path, encoding)` | Every candidate that splits the file consistently — more than one means the file is ambiguous. |
 | `read_header(path, encoding, delimiter)` | Return the list of column names exactly as stored, minus a leading BOM character. Names are never stripped or renamed. |
 | `parse_selection(text, columns)` | Turn user input into an ordered list of 0-based indices. Raise `SelectionError` with a readable message on bad input. |
+| `pick_columns(columns, use_arrow_keys, context)` | Interactive chooser. Uses the arrow-key picker on a terminal, the typed prompt otherwise. |
+| `ColumnPicker` | Draws the column list and handles up/down/space/enter/escape. |
+| `KeyReader` | Reads single keypresses including the arrow keys, on Windows (`msvcrt`) and POSIX (`termios`/`select`). |
 | `count_groups(path, encoding, delimiter, indices)` | Pass 1: build `{key_tuple: group_size}`. |
 | `write_output(...)` | Pass 2: re-read the source, write `Dup_Count` + selected + remaining. |
 | `build_output_order(header, indices)` | Compute the final column order. |
@@ -263,6 +308,27 @@ csv_dupcounter.py          the application (stdlib only)
 test_csv_dupcounter.py     unittest suite, runnable with `python test_csv_dupcounter.py`
 README.md                  usage notes
 ```
+
+### 7.4 Terminal handling
+
+The arrow-key picker needs raw keypresses, which the two target platforms deliver differently:
+
+- **Windows** — `msvcrt.getwch()` returns the arrow keys as a two-byte sequence: a leading `\x00`
+  or `\xe0` followed by a scan code (`H` up, `P` down, `G` home, `O` end, `I` page up, `Q` page
+  down). ANSI escape sequences are drawn only if the console has virtual terminal processing
+  enabled, which the app turns on itself with `SetConsoleMode`; if that fails, the app falls back to
+  the typed prompt rather than drawing a broken screen.
+- **POSIX** — the terminal is put into `cbreak` mode with `termios` (not raw, so Ctrl+C still
+  raises `KeyboardInterrupt`), and bytes are read with `os.read`. An escape sequence is recognised
+  by reading ahead with `select` under a short timeout, so a lone Escape is not confused with the
+  start of a sequence.
+
+The screen is redrawn in place with ANSI cursor-home and clear-to-end sequences, and the cursor is
+hidden while the picker is active and restored afterwards even if the run is interrupted. On
+Windows the console is also restored by `KeyReader.__exit__` when the context manager unwinds.
+
+The picker is skipped entirely when stdin or stdout is not a terminal, which is what makes the
+typed fallback — and therefore scripted use — possible.
 
 ## 8. Error handling
 
@@ -331,6 +397,15 @@ Coverage:
     ambiguity.
 23. **Empty values** — blanks group together; a space is a different key from an empty string.
 24. **Error message text** — the exact strings in §8 are asserted.
+25. **Arrow-key picker** — space toggles, the order of picking is preserved, toggling twice removes
+    a column, Enter with nothing selected does not exit, Escape cancels, Home/End jump to the ends.
+26. **Picker rendering** — the picked order is shown and the bracket numbers mark each column's
+    position in that order.
+27. **Output naming** — the default output path is `dupes-<input name>`; an existing output file is
+    overwritten and the app says so.
+28. **End to end through a pseudo-terminal** — the real picker is driven with real arrow-key escape
+    sequences over a pty, and the exported file is checked for correctness. The arrow-key, space and
+    enter paths, and the escape-cancels path, are all exercised this way.
 
 **Verification environment note:** the test suite runs on Linux in the development sandbox. The
 `GetACP()` branch of `resolve_encoding` cannot execute there directly, so it is covered by injecting

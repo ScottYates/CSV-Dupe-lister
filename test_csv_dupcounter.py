@@ -303,11 +303,15 @@ class CliTests(BaseTestCase):
     def test_default_output_path(self):
         self.assertEqual(
             app.default_output_path(os.path.join("data", "orders.csv")),
-            os.path.join(os.path.abspath("data"), "orders_dupcount.csv"))
+            os.path.join(os.path.abspath("data"), "dupes-orders.csv"))
 
     def test_default_output_path_without_extension(self):
         self.assertTrue(
-            app.default_output_path(os.path.join("data", "orders")).endswith("orders_dupcount.csv"))
+            app.default_output_path(os.path.join("data", "orders")).endswith("dupes-orders.csv"))
+
+    def test_default_output_path_keeps_the_original_extension(self):
+        self.assertTrue(
+            app.default_output_path(os.path.join("data", "orders.TXT")).endswith("dupes-orders.TXT"))
 
     def test_confirm_accepts_blank_as_yes(self):
         self.assertTrue(app.confirm(input_func=lambda prompt: ""))
@@ -584,6 +588,94 @@ class WindowsEncodingTests(BaseTestCase):
 
     def test_no_code_page_off_windows(self):
         self.assertIsNone(app.windows_ansi_codepage())
+
+
+class PickerTests(BaseTestCase):
+    """The arrow-key column chooser."""
+
+    COLUMNS = ["OrderID", "Customer", "City", "Item", "Qty"]
+
+    class FakeReader:
+        def __init__(self, keys):
+            self.keys = list(keys)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read_key(self):
+            return self.keys.pop(0) if self.keys else None
+
+    def run_picker(self, keys, columns=None):
+        picker = app.ColumnPicker(columns or self.COLUMNS)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = picker.run(reader=self.FakeReader(keys))
+        return result, buffer.getvalue()
+
+    def test_space_toggles_and_enter_returns_the_chosen_order(self):
+        result, _ = self.run_picker(["down", "down", "space", "down", "space", "enter"])
+        self.assertEqual(result, [2, 3])
+
+    def test_toggling_a_column_twice_removes_it(self):
+        result, _ = self.run_picker(
+            ["down", "space", "space", "down", "space", "enter"])
+        self.assertEqual(result, [2])
+
+    def test_escape_cancels(self):
+        result, _ = self.run_picker(["esc"])
+        self.assertIsNone(result)
+
+    def test_enter_without_a_selection_does_not_exit(self):
+        result, _ = self.run_picker(["enter", "space", "enter"])
+        self.assertEqual(result, [0])
+
+    def test_home_and_end_jump_to_the_ends(self):
+        result, _ = self.run_picker(["end", "space", "home", "space", "enter"])
+        self.assertEqual(result, [4, 0])
+
+    def test_render_shows_the_pick_order(self):
+        _, screen = self.run_picker(["down", "space", "enter"])
+        self.assertIn("[1]", screen)
+        self.assertIn("Order: Customer", screen)
+
+    def test_pick_columns_uses_the_arrow_picker_when_asked(self):
+        picker = app.ColumnPicker(self.COLUMNS)
+        reader = self.FakeReader(["down", "space", "enter"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = picker.run(reader=reader)
+        self.assertEqual(result, [1])
+
+
+class OutputNamingTests(BaseTestCase):
+    def test_existing_output_file_is_overwritten(self):
+        source = self.write_csv("orders.csv", ORDERS)
+        output = self.path("dupes-orders.csv")
+        with open(output, "w", encoding="cp1252") as handle:
+            handle.write("stale content\r\n")
+        answers = iter(["city,item", "y"])
+        buffer = io.StringIO()
+        with mock.patch("builtins.input", side_effect=answers):
+            with contextlib.redirect_stdout(buffer):
+                code = app.main([source, output, "--encoding", "cp1252"])
+        self.assertEqual(code, 0)
+        self.assertIn("Overwriting existing file", buffer.getvalue())
+        rows = self.read_csv(output)
+        self.assertEqual(rows[0][0], "Dup_Count")
+        self.assertEqual([row[0] for row in rows[1:]], ["3", "3", "0", "3", "3"])
+
+    def test_cli_uses_the_dupes_prefixed_default_output_path(self):
+        source = self.write_csv("orders.csv", ORDERS)
+        answers = iter(["city,item", "y"])
+        buffer = io.StringIO()
+        with mock.patch("builtins.input", side_effect=answers):
+            with contextlib.redirect_stdout(buffer):
+                code = app.main([source, "--encoding", "cp1252"])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(self.path("dupes-orders.csv")))
+        self.assertIn("dupes-orders.csv", buffer.getvalue())
 
 
 if __name__ == "__main__":
