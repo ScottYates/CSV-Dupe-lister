@@ -10,3 +10,6 @@ venv/
 # Harness / tooling directories (not part of the project)
 .plugin-cache/
 .mavis/
+
+# Locally built archive
+*.zip
